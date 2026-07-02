@@ -1,48 +1,67 @@
-// app/api/ask/route.js — free-form question answered over the corpus of summaries.
-import { allSummaries } from "@/lib/db";
-import { callLLM } from "@/lib/llm";
+// app/api/webhook/route.js — Resend inbound → verify → store → summarize.
+import { Webhook } from "svix";
+import { insertEmail, updateSummary } from "@/lib/db";
+import { summarizeEmail } from "@/lib/summarize";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 30; // includes one summarization LLM call
+
+const htmlToText = (h = "") =>
+  h
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\n\s*\n\s*\n/g, "\n\n")
+    .replace(/[ \t]+/g, " ")
+    .trim();
 
 export async function POST(req) {
-  const { question, key } = await req.json().catch(() => ({}));
+  const payload = await req.text();
 
-  const secret = process.env.CRON_SECRET;
-  if (secret && key !== secret) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
+  let evt;
+  if (process.env.RESEND_WEBHOOK_SECRET) {
+    try {
+      evt = new Webhook(process.env.RESEND_WEBHOOK_SECRET).verify(payload, {
+        "svix-id": req.headers.get("svix-id"),
+        "svix-timestamp": req.headers.get("svix-timestamp"),
+        "svix-signature": req.headers.get("svix-signature"),
+      });
+    } catch {
+      return Response.json({ error: "bad signature" }, { status: 400 });
+    }
+  } else {
+    evt = JSON.parse(payload);
   }
-  if (!question || !question.trim()) {
-    return Response.json({ error: "missing question" }, { status: 400 });
+
+  if (evt.type === "email.received") {
+    const x = evt.data;
+    const id = x.email_id || x.id || crypto.randomUUID();
+    const body = x.text || htmlToText(x.html);
+
+    // 1) Store the raw email immediately (so nothing is lost if step 2 fails).
+    await insertEmail({
+      id,
+      sender: x.from,
+      subject: x.subject || "",
+      body_text: body,
+      received_at: Math.floor(Date.now() / 1000),
+    });
+
+    // 2) Summarize + tag. Best-effort: a failure here doesn't fail the webhook,
+    //    and the digest will fall back to the raw body if summary is missing.
+    if (body && body.length > 120) {
+      try {
+        const { summary, tags } = await summarizeEmail({ subject: x.subject || "", sender: x.from, body });
+        await updateSummary(id, summary, tags);
+      } catch (e) {
+        console.error("[summarize] failed:", e.message);
+      }
+    }
   }
 
-  const rows = await allSummaries(500);
-  const usable = rows.filter((r) => r.summary && r.summary.length);
-  if (!usable.length) {
-    return Response.json({ answer: "No summarized newsletters yet — give the pipeline a few inbound issues first.", sources: [] });
-  }
-
-  const corpus = usable
-    .map((r, i) => {
-      const when = new Date(r.received_at * 1000).toISOString().slice(0, 10);
-      return `[${i + 1}] ${r.subject} — ${r.sender} • ${when}\n${r.summary}`;
-    })
-    .join("\n\n");
-
-  const system =
-`You are an industry analyst. Answer the user's question using ONLY the newsletter summaries
-provided. Cite sources inline as [n] referring to the numbered items. Be specific, concise,
-and structured. If the corpus doesn't cover the question, say so plainly rather than guessing.`;
-
-  const answer = await callLLM({
-    system,
-    user: `CORPUS:\n${corpus}\n\nQUESTION: ${question}`,
-    maxTokens: 1400,
-  });
-
-  return Response.json({
-    answer,
-    sources: usable.map((r, i) => ({ n: i + 1, subject: r.subject, sender: r.sender })),
-  });
+  return Response.json({ ok: true });
 }
